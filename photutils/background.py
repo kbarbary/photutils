@@ -1,8 +1,8 @@
 # Licensed under a 3-clause BSD style license - see LICENSE.rst
 
-import math
-
 import numpy as np
+
+#from utils import mode_estimate
 
 def background(data, mask=None, boxsize=None, box_adjust='last',
                cenfunc=np.median, varfunc=np.var, smoothing=None):
@@ -16,13 +16,14 @@ def background(data, mask=None, boxsize=None, box_adjust='last',
     data : array_like
         The array on which to estimate the background.
     boxsize : int, optional
-        The size of boxes in pixels. Can be a tuple (width x height) for
-        rectangles. If None, a scalar (non-variable) background is returned.
-    box_adjust : {'all', 'last', 'none'}
+        The size of boxes in pixels. Can be a tuple or array (height,
+        width) for rectangles. If None, a scalar (non-variable)
+        background is returned.
+    box_adjust : {'even', 'last', 'none'}
         How to adjust boxes if the data shape is not an exact multiple of
         boxsize:
         
-        'all'
+        'even'
             Evenly space all boxes, making them as close to `boxsize` as
             possible.
         'last'
@@ -54,37 +55,40 @@ def background(data, mask=None, boxsize=None, box_adjust='last',
     if data.ndim != 2:
         raise ValueError("only 2-d arrays supported.")
 
-    # Check mask
+    # Check that mask exists and is of the correct shape.
     if mask is not None:
         mask = np.asarray(mask).astype(np.bool)
         if mask.shape != data.shape:
             raise ValueError("shapes of mask and data must match")
 
-    # If boxsize is None, set it to the shape of the data so that a single
-    # box contains all the data. 
+    # If boxsize is None, just go ahead and return scalars
     if boxsize is None:
-        boxsize = data.shape
+        if mask is None:
+            boxdata = data
+        else:
+            boxdata = data[mask]
+        return cenfunc(boxdata), varfunc(boxdata)
 
     # Make boxsize a 1-d array of ints.
     boxsize = np.atleast_1d(boxsize).astype(np.int)
     if boxsize.ndim != 1:
         raise ValueError("Boxsize can be at most 1-dimensional")
-    if boxsize.shape[0] not in [1, 2]:
-        raise ValueError("boxsize must be length 1 or 2.")
 
     # Broadcast boxsize to match data.shape.
     # (`datashape` is not used, this is just for broadcasting boxsize.)
+    if boxsize.shape[0] not in [1, 2]:
+        raise ValueError("boxsize must be length 1 or 2.")
     datashape, boxsize = np.broadcast_arrays(data.shape, boxsize)
     
     # Define bin_edges
+    bin_edges = []
     if box_adjust == 'none':
-        bin_edges = [np.arange(0, data.shape[i] + boxsize[i], boxsize[i])
-                     for i in [0, 1]]
         for i in [0, 1]:
+            bin_edges.append(
+                np.arange(0, data.shape[i] + boxsize[i], boxsize[i]))
             bin_edges[i][-1] = data.shape[i]
 
     elif box_adjust == 'last':
-        bin_edges = []
         for i in [0, 1]:
             remainder = data.shape[i] % boxsize[i]
             if remainder == 0 or remainder > boxsize[i] / 2.:
@@ -93,15 +97,16 @@ def background(data, mask=None, boxsize=None, box_adjust='last',
             else:
                 bin_edges.append(np.arange(0, data.shape[i], boxsize[i]))
             bin_edges[i][-1] = data.shape[i]
-    elif box_adjust == 'all':
-        # TODO: implement this
-        raise ValueError('box_adjust=all not yet implemented')
+    elif box_adjust == 'even':
+        for i in [0, 1]:
+            n_boxes = int(data.shape[i] / boxsize[i] + 0.5)
+            bin_edges.append(
+                np.linspace(0, data.shape[i], n_boxes + 1).astype('int32'))
     else:
-        raise ValueError('Unrecognized value for box_adjust: {0}'.format(
-                box_adjust))
+        raise ValueError('Unrecognized value for box_adjust: '
+                         '{0}'.format(box_adjust))
 
     # Initialize background array
-    # TODO: make the dtype match data.dtype?
     mesh_shape = [bin_edges[0].shape[0] - 1, bin_edges[1].shape[0] - 1]
     if smoothing is not None:
         bkg_mesh = np.empty(mesh_shape, dtype=np.float)
@@ -111,16 +116,17 @@ def background(data, mask=None, boxsize=None, box_adjust='last',
 
 
     # Loop over output boxes
-    for j in range(mesh_shape[0]):
-        for i in range(mesh_shape[1]):
-            box_slice = [slice(bin_edges[j], bin_edges[j + 1]),
-                         slice(bin_edges[i], bin_edges[i + 1])]
-            subdata = data[box_slice]
-            if mask is not None:
-                subdata = subdata[mask[box_slice]]
-            
-            box_cen = cenfunc(subdata)
-            box_var = varfunc(subdata)
+    for y_bin in range(mesh_shape[0]):
+        for x_bin in range(mesh_shape[1]):
+            box_slice = [slice(bin_edges[0][y_bin], bin_edges[0][y_bin + 1]),
+                         slice(bin_edges[1][x_bin], bin_edges[1][x_bin + 1])]
+            if mask is None:
+                boxdata = data[box_slice]
+            else:
+                boxdata = data[mask[box_slice]]
+            box_cen = cenfunc(boxdata)
+            box_var = varfunc(boxdata)
+
             if smoothing is None:
                 bkg[box_slice] = box_cen
                 std[box_slice] = np.sqrt(box_var)
@@ -131,5 +137,5 @@ def background(data, mask=None, boxsize=None, box_adjust='last',
     if smoothing is None:
         return bkg, std
     else:
-        # TODO implement smoothing
+        from scipy.interpolate import SmoothBivariateSpline
         print "smoothing not yet implemented"
