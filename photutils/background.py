@@ -2,11 +2,60 @@
 
 import numpy as np
 
-#from utils import mode_estimate
+def hybrid_bkg(data):
+    """Background estimator used in SExtractor.
 
-def background(data, mask=None, boxsize=None, box_adjust='last',
-               cenfunc=np.median, varfunc=np.var, smoothing=None):
-               #mode_estimator=(2.5, 1.5):
+    Parameters
+    ----------
+    data : array_like
+        The data for which to estimate the background.
+
+    Returns
+    -------
+    bkg : float
+        Estimate of background of the data.
+    std : float
+        Standard deviation of clipped data
+    """
+
+    from astropy import tools
+
+    # Sigma-clip the data at +/-3 sigma around median until convergence.
+    # iters = None takes forever
+    data = np.asarray(data)
+    filtered_data, mask = tools.sigma_clip(data, sig=3., cenfunc=np.median,
+                                           iters=4)
+
+    # If the standard deviation changed less than 20% during the
+    # clipping process, consider the field to be uncrowded and simply
+    # use mean of the clipped distribution. Otherwise, use an estimate
+    # of the mode.
+    raw_std = np.std(data)
+    filtered_std = np.std(filtered_data)
+    if abs((filtered_std - raw_std) / raw_std) < 0.2:
+        return np.mean(filtered_data), filtered_std
+    else:
+        filtered_mode = (2.5 * np.median(filtered_data) - 
+                         1.5 * np.mean(filtered_data))
+        return filtered_mode, filtered_std
+
+
+def clipmode_bkg(data):
+
+    from astropy import tools
+
+    data = np.asarray(data)
+    filtered_data, mask = tools.sigma_clip(data, sig=3., cenfunc=np.median,
+                                           iters=3)
+    filtered_std = np.std(filtered_data)
+    filtered_mode = (2.5 * np.median(filtered_data) - 
+                     1.5 * np.mean(filtered_data))
+    return filtered_mode, filtered_std
+
+
+def background(data, mask=None, boxsize=None, boxadjust='even',
+               bkgfunc=clipmode_bkg, min_unmasked_frac=0.5):
+
     """Estimate global background and standard deviation of image data.
 
     Currently, only 2-d arrays are supported.
@@ -50,6 +99,8 @@ def background(data, mask=None, boxsize=None, box_adjust='last',
     std : float or `~numpy.ndarray`
     """
 
+    from scipy.interpolate import griddata
+
     # Check dimensionality of data
     data = np.asarray(data)
     if data.ndim != 2:
@@ -67,7 +118,7 @@ def background(data, mask=None, boxsize=None, box_adjust='last',
             boxdata = data
         else:
             boxdata = data[mask]
-        return cenfunc(boxdata), varfunc(boxdata)
+        return bkgfunc(boxdata)
 
     # Make boxsize a 1-d array of ints.
     boxsize = np.atleast_1d(boxsize).astype(np.int)
@@ -82,13 +133,13 @@ def background(data, mask=None, boxsize=None, box_adjust='last',
     
     # Define bin_edges
     bin_edges = []
-    if box_adjust == 'none':
+    if boxadjust == 'none':
         for i in [0, 1]:
             bin_edges.append(
                 np.arange(0, data.shape[i] + boxsize[i], boxsize[i]))
             bin_edges[i][-1] = data.shape[i]
 
-    elif box_adjust == 'last':
+    elif boxadjust == 'last':
         for i in [0, 1]:
             remainder = data.shape[i] % boxsize[i]
             if remainder == 0 or remainder > boxsize[i] / 2.:
@@ -97,45 +148,68 @@ def background(data, mask=None, boxsize=None, box_adjust='last',
             else:
                 bin_edges.append(np.arange(0, data.shape[i], boxsize[i]))
             bin_edges[i][-1] = data.shape[i]
-    elif box_adjust == 'even':
+    elif boxadjust == 'even':
         for i in [0, 1]:
             n_boxes = int(data.shape[i] / boxsize[i] + 0.5)
             bin_edges.append(
                 np.linspace(0, data.shape[i], n_boxes + 1).astype('int32'))
     else:
-        raise ValueError('Unrecognized value for box_adjust: '
-                         '{0}'.format(box_adjust))
+        raise ValueError('Unrecognized value for boxadjust: '
+                         '{0}'.format(boxadjust))
 
-    # Initialize background array
-    mesh_shape = [bin_edges[0].shape[0] - 1, bin_edges[1].shape[0] - 1]
-    if smoothing is not None:
-        bkg_mesh = np.empty(mesh_shape, dtype=np.float)
-        var_mesh = np.empty(mesh_shape, dtype=np.float)
-    bkg = np.empty(data.shape, dtype=np.float)
-    std = np.empty(data.shape, dtype=np.float)
+    # Number of boxes in y and x.
+    ny = bin_edges[0].shape[0] - 1
+    nx = bin_edges[1].shape[0] - 1
 
+    # Initialize arrays to hold result in each box.
+    mesh_bkg = np.empty((ny, nx), dtype=np.float)
+    mesh_std = np.empty((ny, nx), dtype=np.float)
+    mesh_ok = np.ones((ny, nx), dtype=np.bool)  # whether there is "enough"
+                                                # data in each box.
 
-    # Loop over output boxes
-    for y_bin in range(mesh_shape[0]):
-        for x_bin in range(mesh_shape[1]):
-            box_slice = [slice(bin_edges[0][y_bin], bin_edges[0][y_bin + 1]),
-                         slice(bin_edges[1][x_bin], bin_edges[1][x_bin + 1])]
-            if mask is None:
-                boxdata = data[box_slice]
-            else:
-                boxdata = data[mask[box_slice]]
-            box_cen = cenfunc(boxdata)
-            box_var = varfunc(boxdata)
+    # Loop over boxes
+    for j in range(ny):
+        for i in range(nx):
 
-            if smoothing is None:
-                bkg[box_slice] = box_cen
-                std[box_slice] = np.sqrt(box_var)
-            else:
-                bkg_mesh[j, i] = box_cen
-                var_mesh[j, i] = box_var
+            # Slice defining the box.
+            boxslice = [slice(bin_edges[0][j], bin_edges[0][j + 1]),
+                        slice(bin_edges[1][i], bin_edges[1][i + 1])]
+            subdata = data[boxslice]
 
-    if smoothing is None:
-        return bkg, std
-    else:
-        from scipy.interpolate import SmoothBivariateSpline
-        print "smoothing not yet implemented"
+            if mask is not None:
+                submask = mask[boxslice]
+
+                # Are there enough unmasked pixels in the box to compute
+                # a good value?
+                total_boxpix = ((bin_edges[0][j + 1] - bin_edges[0][j]) *
+                                (bin_edges[1][i + 1] - bin_edges[1][i]))
+                boxok = np.sum(submask) / total_boxpix > min_unmasked_frac
+
+                if not boxok:  # If not, then flag this box and move on.
+                    mesh_ok[j, i] = False
+                    continue
+
+                subdata = subdata[submask]  # If ok, then use good pixels.
+
+            # Get background, standard deviation estimate for this box
+            box_bkg, box_std = bkgfunc(subdata)
+            mesh_bkg[j, i] = box_bkg
+            mesh_std[j, i] = box_std
+
+    ctr_y = 0.5 * (bin_edges[0][:-1] + bin_edges[0][1:])  # box centers in x
+    ctr_x = 0.5 * (bin_edges[1][:-1] + bin_edges[1][1:])  # box centers in y
+    CTR_X, CTR_Y = np.meshgrid(ctr_x, ctr_y)  # 2-d array of box centers
+    
+    # Reshape everything into 1-d arrays, only including valid box centers
+    boxctrx = CTR_X[mesh_ok]
+    boxctry = CTR_Y[mesh_ok]
+    bkgvals = mesh_bkg[mesh_ok]
+    stdvals = mesh_bkg[mesh_ok]
+
+    # Define output X, Y coordinates:
+    X, Y = np.meshgrid(np.arange(data.shape[1]), np.arange(data.shape[0]))
+
+    bkg = griddata((boxctrx, boxctry), bkgvals, (X, Y), method='cubic')
+    std = griddata((boxctrx, boxctry), stdvals, (X, Y), method='cubic')
+
+    return bkg, std
